@@ -94,12 +94,17 @@ func (r *Range) Hashes() [][]byte {
 
 // Append extends the compact range by appending the passed in hash to it. It
 // reports all the added nodes through the visitor function (if non-nil).
-func (r *Range) Append(hash []byte, visitor VisitFn) error {
+//
+// The visitor can be the legacy VisitFn, a SourceVisitFn, or a NodeVisitFn.
+// Legacy visitors continue to receive exactly the same (NodeID, hash) calls.
+// All nodes reported by Append have SourcePersistent.
+func (r *Range) Append(hash []byte, visitor any) error {
 	if r.end == math.MaxUint64 {
 		return errors.New("range is full")
 	}
-	if visitor != nil {
-		visitor(NewNodeID(0, r.end), hash)
+	emit := normalizeVisitor(visitor)
+	if emit != nil {
+		emit(Node{ID: NewNodeID(0, r.end), Hash: hash, Source: SourcePersistent})
 	}
 	return r.appendImpl(r.end+1, hash, nil, visitor)
 }
@@ -107,7 +112,10 @@ func (r *Range) Append(hash []byte, visitor VisitFn) error {
 // AppendRange extends the compact range by merging in the other compact range
 // from the right. It uses the tree hasher to calculate hashes of newly created
 // nodes, and reports them through the visitor function (if non-nil).
-func (r *Range) AppendRange(other *Range, visitor VisitFn) error {
+//
+// The accepted visitor forms are the same as for Append. Every reported node is
+// persistent.
+func (r *Range) AppendRange(other *Range, visitor any) error {
 	if other.f != r.f {
 		return errors.New("incompatible ranges")
 	}
@@ -125,8 +133,12 @@ func (r *Range) AppendRange(other *Range, visitor VisitFn) error {
 // empty, returns nil.
 //
 // If visitor is not nil, it is called with all "ephemeral" nodes (i.e. the
-// ones rooting imperfect subtrees) along the right border of the tree.
-func (r *Range) GetRootHash(visitor VisitFn) ([]byte, error) {
+// ones rooting imperfect subtrees) along the right border of the tree. The
+// accepted visitor forms are the same as for Append; source-aware visitors see
+// SourceEphemeral for every such call. These events must not be stored as the
+// persistent frontier because a future append can create a stable node with
+// the same NodeID and a different hash.
+func (r *Range) GetRootHash(visitor any) ([]byte, error) {
 	if r.begin != 0 {
 		return nil, fmt.Errorf("begin=%d, want 0", r.begin)
 	}
@@ -134,17 +146,22 @@ func (r *Range) GetRootHash(visitor VisitFn) ([]byte, error) {
 	if ln == 0 {
 		return nil, nil
 	}
+	emit := normalizeVisitor(visitor)
 	hash := r.hashes[ln-1]
 	// All non-perfect subtree hashes along the right border of the tree
 	// correspond to the parents of all perfect subtree nodes except the lowest
 	// one (therefore the loop skips it).
 	for i, size := ln-2, r.end; i >= 0; i-- {
 		hash = r.f.Hash(r.hashes[i], hash)
-		if visitor != nil {
+		if emit != nil {
 			size &= size - 1                              // Delete the previous node.
 			level := uint(bits.TrailingZeros64(size)) + 1 // Compute the parent level.
 			index := size >> level                        // And its horizontal index.
-			visitor(NewNodeID(level, index), hash)
+			emit(Node{
+				ID:     NewNodeID(level, index),
+				Hash:   hash,
+				Source: SourceEphemeral,
+			})
 		}
 	}
 	return hash, nil
@@ -177,7 +194,8 @@ func (r *Range) Equal(other *Range) bool {
 // all the other hashes (possibly none). The method uses the tree hasher to
 // calculate hashes of newly created nodes, and reports them through the
 // visitor function (if non-nil).
-func (r *Range) appendImpl(end uint64, seed []byte, hashes [][]byte, visitor VisitFn) error {
+func (r *Range) appendImpl(end uint64, seed []byte, hashes [][]byte, visitor any) error {
+	emit := normalizeVisitor(visitor)
 	// Bits [low, high) of r.end encode the merge path, i.e. the sequence of node
 	// merges that transforms the two compact ranges into one.
 	low, high := getMergePath(r.begin, r.end, end)
@@ -209,8 +227,12 @@ func (r *Range) appendImpl(end uint64, seed []byte, hashes [][]byte, visitor Vis
 			seed = r.f.Hash(r.hashes[idx1], seed)
 		}
 		index >>= 1
-		if visitor != nil {
-			visitor(NewNodeID(h+1, index), seed)
+		if emit != nil {
+			emit(Node{
+				ID:     NewNodeID(h+1, index),
+				Hash:   seed,
+				Source: SourcePersistent,
+			})
 		}
 	}
 

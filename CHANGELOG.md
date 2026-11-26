@@ -2,6 +2,7 @@
 
 ## HEAD
 
+* Add source-aware node callbacks so durable append nodes can be distinguished from ephemeral nodes synthesized by `Range.GetRootHash`
 * Breaking change: consistency proofs from `size1 = 0` to `size2 != 0` now always fail
   * Previously, this could succeed if the empty proof was provided
 * Bump Go version from 1.19 to 1.20

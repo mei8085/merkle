@@ -260,3 +260,15 @@ update it as the tree state evolves. See the picture below.
 Similarly to the [updatable proofs](#updatable-proofs), the accumulated space /
 bandwidth complexity of updating the state `O(N)` times is `O(N)`, as opposed
 to `O(N log N)` if the witness only stores the single root hash.
+
+Visitor callbacks must distinguish two kinds of reported nodes. Nodes emitted
+by `Append` and `AppendRange` are perfect, immutable nodes and can be stored as
+durable history/frontier state. Nodes emitted by `GetRootHash` while combining
+the right-border hashes of an imperfect tree are ephemeral: they exist only for
+that root computation. A future append can create a durable node with the same
+`NodeID` but a different hash, so source-aware callbacks should discard
+ephemeral events rather than treating them as append history.
+
+The legacy `compact.VisitFn` form remains supported for callers that only need
+the node coordinates and hash. `SourceVisitFn` and `NodeVisitFn` additionally
+receive the source classification.
