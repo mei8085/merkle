@@ -303,6 +303,138 @@ func TestSubtreeInclusion(t *testing.T) {
 	}
 }
 
+// TestSubtreeInclusionNodePositions verifies that a subtree inclusion proof is
+// anchored to the global position of the subtree, not just to the position of
+// the leaf within the subtree.
+//
+// For a non-zero-start subtree, the returned node IDs must be the IDs of the
+// equivalent zero-start proof shifted right by start >> level, keeping their
+// levels unchanged. Every returned node must cover leaves strictly within
+// [start, end). This is what makes the node IDs usable as global storage
+// coordinates: dropping or mangling the shift would make the proof fetch nodes
+// covering a different (e.g. adjacent) range of leaves.
+func TestSubtreeInclusionNodePositions(t *testing.T) {
+	const maxSize = uint64(64)
+	for end := uint64(2); end <= maxSize; end++ {
+		for start := uint64(1); start < end; start++ {
+			if err := isSubtreeValid(start, end); err != nil {
+				continue
+			}
+			for index := start; index < end; index++ {
+				got, err := SubtreeInclusion(index, start, end)
+				if err != nil {
+					t.Fatalf("SubtreeInclusion(%d, %d, %d): %v", index, start, end, err)
+				}
+				rel, err := SubtreeInclusion(index-start, 0, end-start)
+				if err != nil {
+					t.Fatalf("SubtreeInclusion(%d, 0, %d): %v", index-start, end-start, err)
+				}
+				if len(got.IDs) != len(rel.IDs) {
+					t.Fatalf("SubtreeInclusion(%d, %d, %d): got %d nodes, want %d", index, start, end, len(got.IDs), len(rel.IDs))
+				}
+				seen := make(map[compact.NodeID]bool, len(got.IDs))
+				for i, id := range got.IDs {
+					relID := rel.IDs[i]
+					if id.Level != relID.Level {
+						t.Errorf("SubtreeInclusion(%d, %d, %d): node %d level=%d, want %d", index, start, end, i, id.Level, relID.Level)
+						continue
+					}
+					if want := relID.Index + (start >> id.Level); id.Index != want {
+						t.Errorf("SubtreeInclusion(%d, %d, %d): node %d = %v, want index %d (relative %v shifted by start>>level)", index, start, end, i, id, want, relID)
+					}
+					lo, hi := id.Coverage()
+					if lo < start || hi > end {
+						t.Errorf("SubtreeInclusion(%d, %d, %d): node %v covers [%d, %d), outside subtree", index, start, end, id, lo, hi)
+					}
+					if seen[id] {
+						t.Errorf("SubtreeInclusion(%d, %d, %d): duplicate node %v", index, start, end, id)
+					}
+					seen[id] = true
+				}
+				// The relative node IDs must not leak through unchanged: at least the
+				// first (always level-0) node must have moved right by start.
+				if len(rel.IDs) > 0 && got.IDs[0] == rel.IDs[0] {
+					t.Errorf("SubtreeInclusion(%d, %d, %d): nodes not shifted; first node returns relative position %v", index, start, end, got.IDs[0])
+				}
+				// The ephemeral node is likewise expressed in global coordinates.
+				if got.ephem.Level != rel.ephem.Level {
+					t.Errorf("SubtreeInclusion(%d, %d, %d): ephem level=%d, want %d", index, start, end, got.ephem.Level, rel.ephem.Level)
+				}
+				if want := rel.ephem.Index + (start >> rel.ephem.Level); got.ephem.Index != want {
+					t.Errorf("SubtreeInclusion(%d, %d, %d): ephem=%v, want index %d", index, start, end, got.ephem, want)
+				}
+			}
+		}
+	}
+}
+
+// TestSubtreeInclusionSiblingRangesDoNotShareNodes verifies that adjacent,
+// equally shaped subtrees resolve the same relative leaf offset to disjoint
+// global node positions. Otherwise a proof for one subtree could be replayed
+// as a proof for its neighbour by relying on the shared relative path.
+func TestSubtreeInclusionSiblingRangesDoNotShareNodes(t *testing.T) {
+	const block = uint64(8)
+	const maxStart = uint64(512)
+	for start := uint64(0); start+2*block <= maxStart; start += block {
+		// Use the same relative offset (1) in both sibling subtrees.
+		left, err := SubtreeInclusion(start+1, start, start+block)
+		if err != nil {
+			t.Fatalf("SubtreeInclusion(%d, %d, %d): %v", start+1, start, start+block, err)
+		}
+		right, err := SubtreeInclusion(start+block+1, start+block, start+2*block)
+		if err != nil {
+			t.Fatalf("SubtreeInclusion(%d, %d, %d): %v", start+block+1, start+block, start+2*block, err)
+		}
+		if len(left.IDs) == 0 || len(right.IDs) == 0 {
+			t.Fatalf("expected non-empty proofs for sibling blocks starting at %d", start)
+		}
+		if left.IDs[0] == right.IDs[0] {
+			t.Errorf("same relative path resolved to shared node %v for subtrees [%d, %d) and [%d, %d)", left.IDs[0], start, start+block, start+block, start+2*block)
+		}
+		inLeft := make(map[compact.NodeID]bool, len(left.IDs))
+		for _, id := range left.IDs {
+			inLeft[id] = true
+		}
+		for _, id := range right.IDs {
+			if inLeft[id] {
+				t.Errorf("node %v shared by sibling subtrees [%d, %d) and [%d, %d)", id, start, start+block, start+block, start+2*block)
+			}
+		}
+	}
+}
+
+// TestSubtreeInclusionZeroStartContract verifies that the pre-existing
+// zero-start contract is preserved: a subtree starting at 0 produces exactly
+// the same Nodes (including ephemeral node and rehash bounds) as Inclusion,
+// and every node stays within the tree.
+func TestSubtreeInclusionZeroStartContract(t *testing.T) {
+	const maxSize = uint64(256)
+	for size := uint64(1); size <= maxSize; size++ {
+		for index := range size {
+			got, err := SubtreeInclusion(index, 0, size)
+			if err != nil {
+				t.Fatalf("SubtreeInclusion(%d, 0, %d): %v", index, size, err)
+			}
+			want, err := Inclusion(index, size)
+			if err != nil {
+				t.Fatalf("Inclusion(%d, %d): %v", index, size, err)
+			}
+			if diff := cmp.Diff(want, got, cmp.AllowUnexported(Nodes{})); diff != "" {
+				t.Errorf("SubtreeInclusion(%d, 0, %d) != Inclusion: diff (-want +got)\n%s", index, size, diff)
+			}
+			for _, id := range got.IDs {
+				lo, hi := id.Coverage()
+				if hi > size {
+					t.Errorf("SubtreeInclusion(%d, 0, %d): node %v covers [%d, %d), beyond tree size", index, size, id, lo, hi)
+				}
+				if lo <= index && index < hi {
+					t.Errorf("SubtreeInclusion(%d, 0, %d): node %v covers [%d, %d), which includes the proven leaf", index, size, id, lo, hi)
+				}
+			}
+		}
+	}
+}
+
 // TestConsistency contains consistency proof tests. For reference, consider
 // the following example:
 //
